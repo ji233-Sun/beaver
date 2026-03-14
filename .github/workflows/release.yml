@@ -1,0 +1,105 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            os: macos-13
+          - target: aarch64-apple-darwin
+            os: macos-14
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf ../../../be-${{ matrix.target }}.tar.gz be
+          cd ../../..
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: be-${{ matrix.target }}
+          path: be-${{ matrix.target }}.tar.gz
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: be-*.tar.gz
+          generate_release_notes: true
+
+  update-homebrew:
+    needs: release
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate formula
+        run: |
+          export VERSION="${GITHUB_REF_NAME#v}"
+          export SHA_ARM64="$(sha256sum artifacts/be-aarch64-apple-darwin.tar.gz | awk '{print $1}')"
+          export SHA_X86_64="$(sha256sum artifacts/be-x86_64-apple-darwin.tar.gz | awk '{print $1}')"
+          export SHA_LINUX="$(sha256sum artifacts/be-x86_64-unknown-linux-gnu.tar.gz | awk '{print $1}')"
+          envsubst '${VERSION} ${SHA_ARM64} ${SHA_X86_64} ${SHA_LINUX}' \
+            < .github/formula.rb.template \
+            > be.rb
+          echo "--- Generated formula ---"
+          cat be.rb
+
+      - name: Checkout homebrew-tap
+        uses: actions/checkout@v4
+        with:
+          repository: ji233-Sun/homebrew-tap
+          token: ${{ secrets.TAP_TOKEN }}
+          path: homebrew-tap
+
+      - name: Update and push
+        run: |
+          cp be.rb homebrew-tap/Formula/be.rb
+          cd homebrew-tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/be.rb
+          git diff --cached --quiet && echo "No changes" && exit 0
+          git commit -m "Update be to ${GITHUB_REF_NAME}"
+          git push
